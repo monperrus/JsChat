@@ -702,19 +702,34 @@ async function callLLM() {
     'Authorization': `Bearer ${apiKey}`
   };
 
-  const fetchOptions = { method: 'POST', headers, body: JSON.stringify(body), mode: 'cors', credentials: 'omit' };
+  const REQUEST_TIMEOUT_MS = 90000;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const fetchOptions = { method: 'POST', headers, body: JSON.stringify(body), mode: 'cors', credentials: 'omit', signal: controller.signal };
   let response;
   try {
-    response = await fetch(url, fetchOptions);
-  } catch (firstErr) {
-    // First attempt failed (CORS preflight may not have completed yet) — retry once
     try {
-      await new Promise(r => setTimeout(r, 500));
       response = await fetch(url, fetchOptions);
-    } catch (networkErr) {
-      addMessage('system', `❌ Network Error: Failed to connect to ${apiUrl}\nHTTP status: N/A\nDetails: ${networkErr.message}`);
-      return null;
+    } catch (firstErr) {
+      if (firstErr.name === 'AbortError') {
+        addMessage('system', `❌ Timed out waiting for a response from ${apiUrl} after ${REQUEST_TIMEOUT_MS / 1000}s.`);
+        return null;
+      }
+      // First attempt failed (CORS preflight may not have completed yet) — retry once
+      try {
+        await new Promise(r => setTimeout(r, 500));
+        response = await fetch(url, fetchOptions);
+      } catch (networkErr) {
+        if (networkErr.name === 'AbortError') {
+          addMessage('system', `❌ Timed out waiting for a response from ${apiUrl} after ${REQUEST_TIMEOUT_MS / 1000}s.`);
+        } else {
+          addMessage('system', `❌ Network Error: Failed to connect to ${apiUrl}\nHTTP status: N/A\nDetails: ${networkErr.message}`);
+        }
+        return null;
+      }
     }
+  } finally {
+    clearTimeout(timeoutId);
   }
 
   if (!response.ok) {
@@ -743,10 +758,17 @@ async function callLLM() {
 
 function parseToolCalls(response) {
   // response is now { content, tool_calls } from the API
-  const tool_calls = (response.tool_calls || []).map(tc => ({
-    tool: tc.function.name,
-    params: JSON.parse(tc.function.arguments || '{}')
-  }));
+  const tool_calls = (response.tool_calls || []).map(tc => {
+    let params;
+    let parseError = null;
+    try {
+      params = JSON.parse(tc.function.arguments || '{}');
+    } catch (err) {
+      params = {};
+      parseError = `Failed to parse arguments for ${tc.function.name}: ${err.message}`;
+    }
+    return { tool: tc.function.name, params, parseError };
+  });
   return {
     message: response.content || '',
     tool_calls
@@ -830,76 +852,80 @@ async function processUserMessage(userText) {
   messages.push({ role: 'user', content: userText });
   saveMessages();
 
-  let iterations = 0;
-  const maxIterations = 20;
+  try {
+    let iterations = 0;
+    const maxIterations = 20;
 
-  while (iterations < maxIterations) {
-    iterations++;
-    const response = await callLLM();
-    if (!response) break;
+    while (iterations < maxIterations) {
+      iterations++;
+      const response = await callLLM();
+      if (!response) break;
 
-    const parsed = parseToolCalls(response);
+      const parsed = parseToolCalls(response);
 
-    if (!parsed.tool_calls || parsed.tool_calls.length === 0) {
-      if (parsed.message) {
-        addMessage('assistant', parsed.message);
-        messages.push({ role: 'assistant', content: parsed.message });
-        saveMessages();
-      }
-      break;
-    }
-
-    // Build the assistant message with tool_calls for the API
-    // content must be null when tool_calls are present (OpenAI API requirement)
-    const assistantMsg = {
-      role: 'assistant',
-      content: null,
-      tool_calls: response.tool_calls  // original tool_calls from API
-    };
-    messages.push(assistantMsg);
-    saveMessages();
-    // Show the message text in the UI separately
-    if (parsed.message && parsed.message.trim()) {
-      addMessage('assistant', parsed.message.trim());
-    }
-
-    // Execute all tool calls
-    for (const tc of parsed.tool_calls) {
-      const result = await executeToolCall(tc);
-
-      // Add result to messages using proper tool role format
-      const execOutput = result._execOutput;
-      delete result._execOutput;
-      const resultStr = JSON.stringify(result, null, 2);
-      const isExecTool = tc.tool === 'execute_js' || tc.tool === 'execute_file';
-      if (isExecTool && !execOutput && !result.error) {
-        addExecMessage(`${tc.tool} completed without output`);
-      } else {
-        addMessage('tool', `✅ ${tc.tool} result:\n${resultStr}`);
-        if (execOutput) addExecMessage(execOutput);
-      }
-      messages.push({
-        role: 'tool',
-        tool_call_id: response.tool_calls.find(t => t.function.name === tc.tool)?.id || '',
-        content: resultStr
-      });
-      saveMessages();
-
-      // Check if finish was called
-      if (tc.tool === 'finish') {
-        iterations = maxIterations; // break outer loop
+      if (!parsed.tool_calls || parsed.tool_calls.length === 0) {
+        if (parsed.message) {
+          addMessage('assistant', parsed.message);
+          messages.push({ role: 'assistant', content: parsed.message });
+          saveMessages();
+        }
         break;
       }
+
+      // Build the assistant message with tool_calls for the API
+      // content must be null when tool_calls are present (OpenAI API requirement)
+      const assistantMsg = {
+        role: 'assistant',
+        content: null,
+        tool_calls: response.tool_calls  // original tool_calls from API
+      };
+      messages.push(assistantMsg);
+      saveMessages();
+      // Show the message text in the UI separately
+      if (parsed.message && parsed.message.trim()) {
+        addMessage('assistant', parsed.message.trim());
+      }
+
+      // Execute all tool calls
+      for (const tc of parsed.tool_calls) {
+        const result = tc.parseError ? { error: tc.parseError } : await executeToolCall(tc);
+
+        // Add result to messages using proper tool role format
+        const execOutput = result._execOutput;
+        delete result._execOutput;
+        const resultStr = JSON.stringify(result, null, 2);
+        const isExecTool = tc.tool === 'execute_js' || tc.tool === 'execute_file';
+        if (isExecTool && !execOutput && !result.error) {
+          addExecMessage(`${tc.tool} completed without output`);
+        } else {
+          addMessage('tool', `✅ ${tc.tool} result:\n${resultStr}`);
+          if (execOutput) addExecMessage(execOutput);
+        }
+        messages.push({
+          role: 'tool',
+          tool_call_id: response.tool_calls.find(t => t.function.name === tc.tool)?.id || '',
+          content: resultStr
+        });
+        saveMessages();
+
+        // Check if finish was called
+        if (tc.tool === 'finish') {
+          iterations = maxIterations; // break outer loop
+          break;
+        }
+      }
     }
-  }
 
-  if (iterations >= maxIterations) {
-    addMessage('system', '⚠️ Reached maximum iteration limit. The agent may not have completed its task.');
+    if (iterations >= maxIterations) {
+      addMessage('system', '⚠️ Reached maximum iteration limit. The agent may not have completed its task.');
+    }
+  } catch (err) {
+    addMessage('system', `❌ Unexpected error: ${err.message || err}`);
+  } finally {
+    isProcessing = false;
+    document.getElementById('send-btn').disabled = false;
+    document.getElementById('chat-input').disabled = false;
   }
-
-  isProcessing = false;
-  document.getElementById('send-btn').disabled = false;
-  document.getElementById('chat-input').disabled = false;
   document.getElementById('chat-input').focus();
 }
 
